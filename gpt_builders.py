@@ -20,7 +20,8 @@ from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
-import megatron.legacy.model  # isort: skip
+import megatron.legacy.model
+from mhc_tmp import MHCModel  # isort: skip
 
 # NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
 
