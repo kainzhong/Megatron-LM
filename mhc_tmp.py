@@ -329,8 +329,6 @@ class MHCTransformerLayer(TransformerLayer):
 
     @copy_signature(_forward_attention)
     def forward(self, hidden_states: Tensor, *args, **kwargs):
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            print(f"============================= Layer {self.layer_number} forward =============================")
 
         if self.layer_number == 1:
             hidden_states = hidden_states.repeat(1, 1, self.mhc_streams) # (s, b, h) -> (s, b, h * mhc_streams)
@@ -374,8 +372,8 @@ class MHCTransformerLayer(TransformerLayer):
         x = x.transpose(0, 1) # (b, s, h) -- I will fix this to sbh later
         n = self.mhc_streams
         H_pre, H_post, H_res = mhcFusedCombinedOperators(x, self.mhc_phi.T, self.mhc_alpha, self.mhc_beta, n, iterations=5)
-        input_layernorm_output = te.mhc.mHCPreOp.apply(x, H_pre, n)
-        input_layernorm_output = input_layernorm_output.transpose(0, 1) # (s, b, h) -- megatron prefers this
+        pre_mlp_layernorm_output = te.mhc.mHCPreOp.apply(x, H_pre, n)
+        pre_mlp_layernorm_output = pre_mlp_layernorm_output.transpose(0, 1) # (s, b, h) -- megatron prefers this
 
         if self.config.fp32_residual_connection:
             residual = residual.float()
