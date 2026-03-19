@@ -92,7 +92,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 vp_stage=vp_stage,
             )
 
-        model = GPTModel(
+        model = MHCModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=args.padded_vocab_size,

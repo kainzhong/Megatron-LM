@@ -200,7 +200,7 @@ class MHCTransformerLayer(TransformerLayer):
         # These are all hardcoded for now. I will clean these up after I figure out how mcore is supposed to be used
         self.mhc_alpha = torch.nn.Parameter(torch.ones(3, dtype=dtype, device="cuda"))
         self.mhc_beta = torch.nn.Parameter(torch.zeros(1, 2*n + n*n, dtype=dtype, device="cuda"))
-        self.mhc_phi = torch.nn.Parameter(torch.empty(32, n * config.hidden_size, dtype=dtype, device="cuda")) # Column-major layout for Triton
+        self.mhc_phi = torch.nn.Parameter(torch.zeros(32, n * config.hidden_size, dtype=dtype, device="cuda")) # Column-major layout for Triton
         torch.nn.init.xavier_normal_(self.mhc_phi, gain=0.02)
 
         setattr(self.mhc_alpha, 'sequence_parallel', True)
@@ -258,33 +258,25 @@ class MHCTransformerLayer(TransformerLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        residual = x
+
         x = x.transpose(0, 1) # (b, s, h) -- I will fix this to sbh later
         n = self.mhc_streams
         H_pre, H_post, H_res = mhcFusedCombinedOperators(x, self.mhc_phi.T, self.mhc_alpha, self.mhc_beta, n, iterations=5)
-        hidden_states = te.mhc.mHCPreOp.apply(x, H_pre, n)
-        hidden_states = hidden_states.transpose(0, 1) # (s, b, h) -- megatron prefers this
+        input_layernorm_output = te.mhc.mHCPreOp.apply(x, H_pre, n)
+        input_layernorm_output = input_layernorm_output.transpose(0, 1) # (s, b, h) -- megatron prefers this
+
 
         # Optional Input Layer norm
-        if self.recompute_input_layernorm:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
-                input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                    apply_module(self.input_layernorm), hidden_states
-                )
-        else:
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
-                input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
-
-        if isinstance(input_layernorm_output, tuple):
-            if len(input_layernorm_output) != 2:
-                raise ValueError(
-                    f"When the output of input_layernorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(input_layernorm_output)}"
-                )
-            input_layernorm_output, residual = input_layernorm_output
-        else:
-            residual = hidden_states
+        # if self.recompute_input_layernorm:
+        #     self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+        #     with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+        #         input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
+        #             apply_module(self.input_layernorm), hidden_states
+        #         )
+        # else:
+        #     with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+        #         input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
@@ -337,6 +329,9 @@ class MHCTransformerLayer(TransformerLayer):
 
     @copy_signature(_forward_attention)
     def forward(self, hidden_states: Tensor, *args, **kwargs):
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            print(f"============================= Layer {self.layer_number} forward =============================")
+
         if self.layer_number == 1:
             hidden_states = hidden_states.repeat(1, 1, self.mhc_streams) # (s, b, h) -> (s, b, h * mhc_streams)
 
@@ -374,26 +369,13 @@ class MHCTransformerLayer(TransformerLayer):
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
 
+        residual = x
+
         x = x.transpose(0, 1) # (b, s, h) -- I will fix this to sbh later
         n = self.mhc_streams
         H_pre, H_post, H_res = mhcFusedCombinedOperators(x, self.mhc_phi.T, self.mhc_alpha, self.mhc_beta, n, iterations=5)
-        hidden_states = te.mhc.mHCPreOp.apply(x, H_pre, n)
-        hidden_states = hidden_states.transpose(0, 1) # (s, b, h) -- megatron prefers this
-
-        # Optional Layer norm post the cross-attention.
-        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
-
-        if isinstance(pre_mlp_layernorm_output, tuple):
-            if len(pre_mlp_layernorm_output) != 2:
-                raise ValueError(
-                    f"When the output of pre_mlp_layernorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(pre_mlp_layernorm_output)}"
-                )
-            pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
-        else:
-            # Residual connection.
-            residual = hidden_states
+        input_layernorm_output = te.mhc.mHCPreOp.apply(x, H_pre, n)
+        input_layernorm_output = input_layernorm_output.transpose(0, 1) # (s, b, h) -- megatron prefers this
 
         if self.config.fp32_residual_connection:
             residual = residual.float()
