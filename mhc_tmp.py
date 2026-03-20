@@ -198,14 +198,23 @@ class MHCTransformerLayer(TransformerLayer):
         dtype = config.params_dtype
         n = self.mhc_streams
         # These are all hardcoded for now. I will clean these up after I figure out how mcore is supposed to be used
-        self.mhc_alpha = torch.nn.Parameter(torch.ones(3, dtype=dtype, device="cuda"))
-        self.mhc_beta = torch.nn.Parameter(torch.zeros(1, 2*n + n*n, dtype=dtype, device="cuda"))
-        self.mhc_phi = torch.nn.Parameter(torch.zeros(32, n * config.hidden_size, dtype=dtype, device="cuda")) # Column-major layout for Triton
-        torch.nn.init.xavier_normal_(self.mhc_phi, gain=0.02)
+        self.mhc_alpha_attn = torch.nn.Parameter(torch.ones(3, dtype=dtype, device="cuda"))
+        self.mhc_beta_attn = torch.nn.Parameter(torch.zeros(1, 2*n + n*n, dtype=dtype, device="cuda"))
+        self.mhc_phi_attn = torch.nn.Parameter(torch.zeros(32, n * config.hidden_size, dtype=dtype, device="cuda")) # Column-major layout for Triton
+        torch.nn.init.xavier_normal_(self.mhc_phi_attn, gain=0.02)
 
-        setattr(self.mhc_alpha, 'sequence_parallel', True)
-        setattr(self.mhc_beta, 'sequence_parallel', True)
-        setattr(self.mhc_phi, 'sequence_parallel', True)
+        setattr(self.mhc_alpha_attn, 'sequence_parallel', True)
+        setattr(self.mhc_beta_attn, 'sequence_parallel', True)
+        setattr(self.mhc_phi_attn, 'sequence_parallel', True)
+
+        self.mhc_alpha_mlp = torch.nn.Parameter(torch.ones(3, dtype=dtype, device="cuda"))
+        self.mhc_beta_mlp = torch.nn.Parameter(torch.zeros(1, 2*n + n*n, dtype=dtype, device="cuda"))
+        self.mhc_phi_mlp = torch.nn.Parameter(torch.zeros(32, n * config.hidden_size, dtype=dtype, device="cuda")) # Column-major layout for Triton
+        torch.nn.init.xavier_normal_(self.mhc_phi_mlp, gain=0.02)
+
+        setattr(self.mhc_alpha_mlp, 'sequence_parallel', True)
+        setattr(self.mhc_beta_mlp, 'sequence_parallel', True)
+        setattr(self.mhc_phi_mlp, 'sequence_parallel', True)
 
     def _forward_attention(
         self,
@@ -262,7 +271,7 @@ class MHCTransformerLayer(TransformerLayer):
 
         x = x.transpose(0, 1) # (b, s, h) -- I will fix this to sbh later
         n = self.mhc_streams
-        H_pre, H_post, H_res = mhcFusedCombinedOperators(x, self.mhc_phi.T, self.mhc_alpha, self.mhc_beta, n, iterations=5)
+        H_pre, H_post, H_res = mhcFusedCombinedOperators(x, self.mhc_phi_attn.T, self.mhc_alpha_attn, self.mhc_beta_attn, n, iterations=5)
         input_layernorm_output = te.mhc.mHCPreOp.apply(x, H_pre, n)
         input_layernorm_output = input_layernorm_output.transpose(0, 1) # (s, b, h) -- megatron prefers this
 
@@ -371,7 +380,7 @@ class MHCTransformerLayer(TransformerLayer):
 
         x = x.transpose(0, 1) # (b, s, h) -- I will fix this to sbh later
         n = self.mhc_streams
-        H_pre, H_post, H_res = mhcFusedCombinedOperators(x, self.mhc_phi.T, self.mhc_alpha, self.mhc_beta, n, iterations=5)
+        H_pre, H_post, H_res = mhcFusedCombinedOperators(x, self.mhc_phi_mlp.T, self.mhc_alpha_mlp, self.mhc_beta_mlp, n, iterations=5)
         pre_mlp_layernorm_output = te.mhc.mHCPreOp.apply(x, H_pre, n)
         pre_mlp_layernorm_output = pre_mlp_layernorm_output.transpose(0, 1) # (s, b, h) -- megatron prefers this
 
