@@ -24,15 +24,6 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.typed_torch import apply_module, copy_signature
 
 import transformer_engine.pytorch as te
-from torch.utils.tensorboard import SummaryWriter
-
-_tb_writer: Optional[SummaryWriter] = None
-
-def _get_tb_writer() -> SummaryWriter:
-    global _tb_writer
-    if _tb_writer is None:
-        _tb_writer = SummaryWriter(log_dir="tensorboard_logs/mhc")
-    return _tb_writer
 
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -353,34 +344,15 @@ class MHCTransformerLayer(TransformerLayer):
             MHCTransformerLayer._tb_step += 1
         step = MHCTransformerLayer._tb_step
 
-        if is_rank0:
-            writer = _get_tb_writer()
-            tag = f"layer_{self.layer_number}/hidden_states"
-            writer.add_scalar(f"{tag}/before_attn/abs_max", hidden_states.abs().max().item(), step)
-            writer.add_scalar(f"{tag}/before_attn/std", hidden_states.std().item(), step)
-            writer.add_scalar(f"{tag}/before_attn/norm", hidden_states.norm().item(), step)
-
         if self.layer_number == 1:
             hidden_states = hidden_states.repeat(1, 1, self.mhc_streams) # (s, b, h) -> (s, b, h * mhc_streams)
 
         hidden_states, context = self._forward_attention(hidden_states, *args, **kwargs)
-        if is_rank0:
-            writer = _get_tb_writer()
-            tag = f"layer_{self.layer_number}/hidden_states"
-            writer.add_scalar(f"{tag}/after_attn/abs_max", hidden_states.abs().max().item(), step)
-            writer.add_scalar(f"{tag}/after_attn/std", hidden_states.std().item(), step)
-            writer.add_scalar(f"{tag}/after_attn/norm", hidden_states.norm().item(), step)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
         )
-        if is_rank0:
-            writer = _get_tb_writer()
-            tag = f"layer_{self.layer_number}/hidden_states"
-            writer.add_scalar(f"{tag}/after_mlp/abs_max", output.abs().max().item(), step)
-            writer.add_scalar(f"{tag}/after_mlp/std", output.std().item(), step)
-            writer.add_scalar(f"{tag}/after_mlp/norm", output.norm().item(), step)
 
         if self.layer_number == self.config.num_layers:
             output = output.view(output.shape[0], output.shape[1], -1, self.config.hidden_size) # (s, b, h * mhc_streams) -> (s, b, h)
