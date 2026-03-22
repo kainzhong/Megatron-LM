@@ -339,11 +339,6 @@ class MHCTransformerLayer(TransformerLayer):
 
     @copy_signature(_forward_attention)
     def forward(self, hidden_states: Tensor, *args, **kwargs):
-        is_rank0 = torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
-        if is_rank0 and self.layer_number == 1:
-            MHCTransformerLayer._tb_step += 1
-        step = MHCTransformerLayer._tb_step
-
         if self.layer_number == 1:
             hidden_states = hidden_states.repeat(1, 1, self.mhc_streams) # (s, b, h) -> (s, b, h * mhc_streams)
 
