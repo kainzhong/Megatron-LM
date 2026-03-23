@@ -342,16 +342,27 @@ class MHCTransformerLayer(TransformerLayer):
         if self.layer_number == 1:
             hidden_states = hidden_states.repeat(1, 1, self.mhc_streams) # (s, b, h) -> (s, b, h * mhc_streams)
 
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            print(f"Layer {self.layer_number} before attention absmax: {hidden_states.abs().max().item()}")
+
         hidden_states, context = self._forward_attention(hidden_states, *args, **kwargs)
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            print(f"Layer {self.layer_number} after attention absmax: {hidden_states.abs().max().item()}")
+        
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
         )
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            print(f"Layer {self.layer_number} after MLP absmax: {output.abs().max().item()}")
 
         if self.layer_number == self.config.num_layers:
             output = output.view(output.shape[0], output.shape[1], -1, self.config.hidden_size) # (s, b, h * mhc_streams) -> (s, b, h)
             output = output.sum(dim=2) # sum over the mhc_streams dimension to get back to (s, b, h)
+
+            if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                print(f"Layer {self.layer_number} after summing mhc streams absmax: {output.abs().max().item()}")
 
         return output, context
 
