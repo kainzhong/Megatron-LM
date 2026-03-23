@@ -433,6 +433,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 return
 
             if param in self.param_to_bucket_group:
+                logger.info(f"[RANK {torch.distributed.get_rank()}] Running backward post hook for param {param.shape} with dtype {param.dtype}, param absmax={param.data.abs().max()}, grad absmax={param.grad.data.abs().max() if param.grad is not None else 'None'}")
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
                     assert (
