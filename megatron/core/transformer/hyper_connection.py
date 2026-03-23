@@ -159,10 +159,45 @@ class HyperConnectionModule(MegatronModule):
             self._h_post_bda_op = fused_h_post_bda
             self._proj_rms_op = fused_proj_rms
         else:
-            self._sinkhorn_op = native_sinkhorn
-            self._h_aggregate_op = native_h_aggregate
-            self._h_post_bda_op = native_h_post_bda
-            self._proj_rms_op = native_proj_rms
+            from transformer_engine.pytorch.triton.mhc import (
+                mHCProjectionOp,
+                mHCElementwiseOp,
+                mHCSinkhornOp,
+                mHCPreOp,
+                mHCPostResOp,
+            )
+            def mHCSinkhornFunc(h_res, iterations, eps):
+                return mHCSinkhornOp.apply(h_res, self.n, iterations)
+            def mHCElementwiseFunc(proj, alpha, bias, r, n):
+                out = mHCElementwiseOp.apply(proj, alpha, bias, r, n)
+                h_pre = out[..., : self.n]
+                h_post = out[..., self.n : 2 * self.n]
+                h_res = out[..., 2 * self.n : self.n * self.n + 2 * self.n]
+                return h_pre, h_post, h_res
+            def mHCPreFunc(x_streams, h_pre):
+                s, b, n, C = x_streams.shape
+                h_pre = h_pre.reshape(s, b, n)
+                return mHCPreOp.apply(x_streams, h_pre, self.n)
+            def mHCPostBdaFunc(h_res, orig_reshaped, h_post, x, bias):
+                s, b, n, C = orig_reshaped.shape
+                h_post = h_post.reshape(s, b, n)
+                return mHCPostResOp.apply(
+                    (x if bias is None else x + bias),
+                    h_post, 
+                    orig_reshaped, 
+                    h_res, 
+                    20
+                )
+            def mHCProjectionFunc(x, weight, eps):
+                proj, r = mHCProjectionOp.apply(x, weight)
+                proj = proj.squeeze(0)
+                r = 1 / r.view(-1, 1)
+                return proj, r
+            self._sinkhorn_op = mHCSinkhornFunc
+            self._compute_h_op = mHCElementwiseFunc
+            self._h_aggregate_op = mHCPreFunc
+            self._h_post_bda_op = mHCPostBdaFunc
+            self._proj_rms_op = mHCProjectionFunc
 
         self._init_weights()
 
@@ -207,21 +242,26 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights
             h_res: [s, b, n^2] - residual mixing logits
         """
-        alpha_ = torch.cat(
-            [
-                self.alpha_pre.expand(self.n),
-                self.alpha_post.expand(self.n),
-                self.alpha_res.expand(self.n * self.n),
-            ],
-            dim=-1,
-        )
-        h = r * proj * alpha_ + self.bias
-        # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
-        h_pre = h[..., : self.n].sigmoid()  # [s, b, n]
+        # alpha_ = torch.cat(
+        #     [
+        #         self.alpha_pre.expand(self.n),
+        #         self.alpha_post.expand(self.n),
+        #         self.alpha_res.expand(self.n * self.n),
+        #     ],
+        #     dim=-1,
+        # )
+        # h = r * proj * alpha_ + self.bias
+        # # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
+        # h_pre = h[..., : self.n].sigmoid()  # [s, b, n]
 
-        # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
-        h_post = h[..., self.n : 2 * self.n].sigmoid() * 2  # [s, b, n]
-        h_res = h[..., 2 * self.n :]
+        # # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
+        # h_post = h[..., self.n : 2 * self.n].sigmoid() * 2  # [s, b, n]
+        # h_res = h[..., 2 * self.n :]
+        s, b, _ = proj.shape 
+        proj = proj.reshape(-1, 32)
+        r = r.reshape(-1)
+        alpha = torch.cat([self.alpha_pre, self.alpha_post, self.alpha_res], dim=-1)
+        h_pre, h_post, h_res = self._compute_h_op(proj, alpha, self.bias, r, self.n)
         return h_pre, h_post, h_res
 
     @nvtx_decorator(message="HyperConnection::compute_mappings")
