@@ -282,7 +282,11 @@ class TestNativeHPostBDA:
 
         hr_triton, orig_triton, hp_triton, x_triton, bi_triton = _make_inputs()
         out_triton = mHCPostResOp.apply(
-            (x_triton if bi_triton is None else x_triton + bi_triton), hp_triton, orig_triton, hr_triton, 20
+            (x_triton if bi_triton is None else x_triton + bi_triton), 
+            hp_triton, 
+            orig_triton, 
+            hr_triton, 
+            20
         )
         out_triton.backward(grad_out)
 
@@ -524,22 +528,22 @@ class TestEndToEndNative:
             w = w_data.clone().requires_grad_(True)
 
             x_2d = hs.reshape(s * b, n * C)
-            proj, r = mHCProjectionOp.apply(x_2d, w.T.contiguous(), eps)
-            proj = proj.view(s, b, -1)
+            proj, r = mHCProjectionOp.apply(x_2d, w, eps)
+            proj = proj.view(s, b, -1)[:, :2*n + n*n]
             r = r.view(s, b, 1)
 
             h = proj / r
             h_pre = h[..., :n].sigmoid()
             h_post = h[..., n : 2 * n].sigmoid() * 2
-            h_res_logits = h[..., 2 * n :]
-            h_res = mHCSinkhornOp.apply(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            h_res_logits = h[..., 2 * n : 2 * n + n * n]
+            h_res = mHCSinkhornOp.apply(h_res_logits.view(s, b, n, n), n, sinkhorn_iters)
 
-            aggregated = mHCPreOp.apply(hs, h_pre, 4)
+            aggregated = mHCPreOp.apply(hs.reshape(s, b, n, C), h_pre, 4)
 
             output = mHCPostResOp.apply(
-                (hs.view(s, b, C) + layer_bias_data.view(1, 1, C)),
+                layer_out_data if layer_bias_data is None else layer_out_data + layer_bias_data,
                 h_post,
-                hs.view(s, b, n*C),
+                hs.view(s, b, n, C),
                 h_res,
                 20
             )
