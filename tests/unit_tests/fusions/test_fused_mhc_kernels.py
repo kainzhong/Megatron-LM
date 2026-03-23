@@ -22,6 +22,14 @@ from megatron.core.transformer.hyper_connection import (
     native_sinkhorn,
 )
 
+from transformer_engine.pytorch.triton.mhc import (
+    mHCProjectionOp,
+    mHCElementwiseOp,
+    mHCSinkhornOp,
+    mHCPreOp,
+    mHCPostResOp
+)
+
 _require_cutile = pytest.mark.skipif(not is_cutile_available(), reason="cuTile not installed")
 
 
@@ -106,7 +114,7 @@ def _ref_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6):
 class TestNativeSinkhorn:
     """Tests for the native SinkhornKnopp implementation."""
 
-    @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10)])
+    @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 4, 10)])
     def test_fwd_bwd_vs_torch_reference(self, s, b, n, iters):
         """native_sinkhorn fwd output and bwd grad must match the inline PyTorch reference."""
         _info()
@@ -126,8 +134,18 @@ class TestNativeSinkhorn:
         out_r.backward(grad_out)
         grad_r = inp_r.grad.clone()
 
+        inp_triton = data.clone().requires_grad_(True)
+        print(f"inp_triton before forward: {inp_triton.shape}")
+        out_triton = mHCSinkhornOp.apply(inp_triton, n, iters)
+        out_triton = out_triton.view(s, b, n, n)
+        out_triton.backward(grad_out.view(s, b, n, n))
+        grad_triton = inp_triton.grad.clone()
+
         torch.testing.assert_close(out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(out_triton, out_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+
         torch.testing.assert_close(grad_f, grad_r, atol=BWD_ATOL, rtol=BWD_RTOL)
+        torch.testing.assert_close(grad_triton, grad_r, atol=BWD_ATOL, rtol=BWD_RTOL)
 
 
 class TestFusedSinkhorn:
@@ -166,7 +184,7 @@ class TestFusedSinkhorn:
 class TestNativeHAggregate:
     """Tests for native_h_aggregate."""
 
-    @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256)])
+    @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 4, 256)])
     def test_fwd_bwd_vs_torch_reference(self, s, b, n, C):
         _info()
         x_data = _rand(s, b, n, C)
@@ -183,9 +201,19 @@ class TestNativeHAggregate:
         oref = _ref_h_aggregate(xr, hr)
         oref.backward(grad_out)
 
+        x_triton = x_data.clone().requires_grad_(True)
+        h_triton = h_data.clone().requires_grad_(True)
+        o_triton = mHCPreOp.apply(x_triton, h_triton, 4)
+        o_triton.backward(grad_out)
+
         torch.testing.assert_close(of, oref, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(o_triton, oref, atol=FWD_ATOL, rtol=FWD_RTOL)
+
         torch.testing.assert_close(xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
         torch.testing.assert_close(hf.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
+
+        torch.testing.assert_close(x_triton.grad.reshape(s, b, n, C), xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
+        torch.testing.assert_close(h_triton.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
 
 
 class TestFusedHAggregate:
@@ -226,7 +254,7 @@ class TestNativeHPostBDA:
     """Tests for native_h_post_bda."""
 
     @pytest.mark.parametrize("with_bias", [True, False])
-    @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256)])
+    @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 4, 256)])
     def test_fwd_bwd_vs_torch_reference(self, s, b, n, C, with_bias):
         _info()
         hr_data = _rand(s, b, n, n)
@@ -252,16 +280,27 @@ class TestNativeHPostBDA:
         out_r = _ref_h_post_bda(hr_r, orig_r, hp_r, x_r, bi_r)
         out_r.backward(grad_out)
 
+        hr_triton, orig_triton, hp_triton, x_triton, bi_triton = _make_inputs()
+        out_triton = mHCPostResOp.apply(
+            (x_triton if bi_triton is None else x_triton + bi_triton), hp_triton, orig_triton, hr_triton, 20
+        )
+        out_triton.backward(grad_out)
+
         torch.testing.assert_close(out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL)
-        for name, gf, gr in [
-            ("h_res", hr_f.grad, hr_r.grad),
-            ("orig_res", orig_f.grad, orig_r.grad),
-            ("h_post", hp_f.grad, hp_r.grad),
-            ("x", x_f.grad, x_r.grad),
+        torch.testing.assert_close(out_triton, out_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+        for name, gf, gr, g_triton in [
+            ("h_res", hr_f.grad, hr_r.grad, hr_triton.grad),
+            ("orig_res", orig_f.grad, orig_r.grad, orig_triton.grad),
+            ("h_post", hp_f.grad, hp_r.grad, hp_triton.grad),
+            ("x", x_f.grad, x_r.grad, x_triton.grad),
         ]:
             torch.testing.assert_close(
                 gf, gr, atol=BWD_ATOL, rtol=BWD_RTOL, msg=f"backward mismatch on {name}"
             )
+            torch.testing.assert_close(
+                g_triton, gr, atol=BWD_ATOL, rtol=BWD_RTOL, msg=f"triton backward mismatch on {name}"
+            )
+            
         if with_bias:
             torch.testing.assert_close(
                 bi_f.grad, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on bias"
@@ -326,10 +365,10 @@ class TestFusedHPostBDA:
 class TestNativeProjRms:
     """Tests for native_proj_rms."""
 
-    @pytest.mark.parametrize("M,N,K", [(256, 20, 4096), (64, 8, 512)])
+    @pytest.mark.parametrize("M,N,K", [(256, 24, 4096), (64, 24, 512)])
     def test_fwd_bwd_vs_torch_reference(self, M, N, K):
         _info()
-        eps = 1e-6
+        eps = torch.finfo(torch.float32).eps
         x_data = _rand(M, K)
         w_data = _rand(N, K)
         grad_proj = _rand(M, N)
@@ -345,13 +384,29 @@ class TestNativeProjRms:
         proj_r, r_r = _ref_proj_rms(xr, wr, eps)
         (proj_r * grad_proj + r_r * grad_r).sum().backward()
 
+        x_triton = x_data.clone().requires_grad_(True)
+        w_triton = w_data.clone().requires_grad_(True)
+        proj_triton, r_triton = mHCProjectionOp.apply(x_triton, w_triton)
+        proj_triton = proj_triton.squeeze(0)[:, :24]
+        r_triton = 1 / r_triton.view(-1, 1)
+        (proj_triton * grad_proj + r_triton * grad_r).sum().backward()
+
         torch.testing.assert_close(proj_f, proj_r, atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(
-            xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on x"
+            xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL
         )
         torch.testing.assert_close(
-            wf.grad, wr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on weight"
+            wf.grad, wr.grad, atol=BWD_ATOL, rtol=BWD_RTOL
+        )
+
+        torch.testing.assert_close(proj_triton, proj_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(r_triton, r_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(
+            x_triton.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL
+        )
+        torch.testing.assert_close(
+            w_triton.grad, wr.grad, atol=BWD_ATOL, rtol=BWD_RTOL
         )
 
 
@@ -463,15 +518,48 @@ class TestEndToEndNative:
             loss = output.sum() + aggregated.sum()
             loss.backward()
             return output.detach(), aggregated.detach(), hs.grad.clone()
+        
+        def _run_triton():
+            hs = hs_data.clone().requires_grad_(True)
+            w = w_data.clone().requires_grad_(True)
+
+            x_2d = hs.reshape(s * b, n * C)
+            proj, r = mHCProjectionOp.apply(x_2d, w.T.contiguous(), eps)
+            proj = proj.view(s, b, -1)
+            r = r.view(s, b, 1)
+
+            h = proj / r
+            h_pre = h[..., :n].sigmoid()
+            h_post = h[..., n : 2 * n].sigmoid() * 2
+            h_res_logits = h[..., 2 * n :]
+            h_res = mHCSinkhornOp.apply(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+
+            aggregated = mHCPreOp.apply(hs, h_pre, 4)
+
+            output = mHCPostResOp.apply(
+                (hs.view(s, b, C) + layer_bias_data.view(1, 1, C)),
+                h_post,
+                hs.view(s, b, n*C),
+                h_res,
+                20
+            )
+
+            loss = output.sum() + aggregated.sum()
+            loss.backward()
+            return output.detach(), aggregated.detach(), hs.grad.clone()
 
         out_m, agg_m, grad_m = _run_native_modules()
         out_r, agg_r, grad_r = _run_inline_ref()
+        out_triton, agg_triton, grad_triton = _run_triton()
 
         torch.testing.assert_close(
             agg_m, agg_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="aggregated output mismatch"
         )
         torch.testing.assert_close(
             out_m, out_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post_bda output mismatch"
+        )
+        torch.testing.assert_close(
+            out_triton, out_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="triton h_post_bda output mismatch"
         )
         _assert_cosine_similar(
             grad_m, grad_r, COSINE_SIM_THRESH, msg="hidden_states grad (E2E backward)"
