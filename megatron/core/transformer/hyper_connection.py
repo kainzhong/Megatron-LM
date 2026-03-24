@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointManager
 
 
-@torch.compile
+# @torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
     row_max = input_logits.max(dim=-1, keepdim=True).values
     M = torch.exp(input_logits - row_max)
@@ -58,13 +58,13 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
     return SinkhornKnopp.apply(input_logits, num_iterations, eps)
 
 
-@torch.compile
+# @torch.compile
 def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
-@torch.compile
+# @torch.compile
 def native_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
@@ -80,14 +80,13 @@ def native_h_post_bda(
     return x_expanded + mixed
 
 
-@torch.compile
+# @torch.compile
 def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
     """Native fused projection + RMS normalization."""
     proj = torch.matmul(x, weight.t())
     norm = x.norm(dim=-1, keepdim=True)
     K = x.shape[-1]
-    v = norm / math.sqrt(K) + eps
-    r = 1.0 / v
+    r = norm / math.sqrt(K) + eps
     return proj, r
 
 
@@ -191,7 +190,7 @@ class HyperConnectionModule(MegatronModule):
             def mHCProjectionFunc(x, weight, eps):
                 proj, r = mHCProjectionOp.apply(x, weight)
                 proj = proj.squeeze(0)
-                r = 1 / r.view(-1, 1)
+                r = r.view(-1, 1)
                 return proj, r
             self._sinkhorn_op = mHCSinkhornFunc
             self._compute_h_op = mHCElementwiseFunc
@@ -228,7 +227,6 @@ class HyperConnectionModule(MegatronModule):
         proj, r = self._proj_rms_op(x_2d, self.mapping_proj.weight, self.norm_eps)
         return proj.view(s, b, -1), r.view(s, b, 1)
 
-    @torch.compile
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute h from projected hidden states and scaling factors.
@@ -242,26 +240,14 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights
             h_res: [s, b, n^2] - residual mixing logits
         """
-        # alpha_ = torch.cat(
-        #     [
-        #         self.alpha_pre.expand(self.n),
-        #         self.alpha_post.expand(self.n),
-        #         self.alpha_res.expand(self.n * self.n),
-        #     ],
-        #     dim=-1,
-        # )
-        # h = r * proj * alpha_ + self.bias
-        # # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
-        # h_pre = h[..., : self.n].sigmoid()  # [s, b, n]
-
-        # # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
-        # h_post = h[..., self.n : 2 * self.n].sigmoid() * 2  # [s, b, n]
-        # h_res = h[..., 2 * self.n :]
         s, b, _ = proj.shape 
+
         proj = proj.reshape(-1, 32)
         r = r.reshape(-1)
         alpha = torch.cat([self.alpha_pre, self.alpha_post, self.alpha_res], dim=-1)
         h_pre, h_post, h_res = self._compute_h_op(proj, alpha, self.bias, r, self.n)
+
+        # return h_pre_ref, h_post_ref, h_res_ref
         return h_pre, h_post, h_res
 
     @nvtx_decorator(message="HyperConnection::compute_mappings")
@@ -287,7 +273,6 @@ class HyperConnectionModule(MegatronModule):
         h_res = self._sinkhorn_op(
             h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations, self.norm_eps
         )  # [s, b, n, n]
-
         return h_pre, h_post, h_res
 
     @torch.compile
@@ -387,7 +372,9 @@ class HyperConnectionModule(MegatronModule):
         s, b, _ = x.shape
         C = self.hidden_size
         x_streams = x.view(s, b, self.n, C)
-        return self._h_aggregate_op(x_streams, h_pre)
+        out = self._h_aggregate_op(x_streams, h_pre)
+
+        return out
 
     @torch.compile
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:

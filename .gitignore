@@ -20,3 +20,9 @@ runs/
 # Sphinx documentation
 docs/_build
 docs/apidocs
+
+assets/*
+benchmark_cache*/*
+checkpoints/*
+tensorboard_logs/*
+llama3_tokenizer/*
