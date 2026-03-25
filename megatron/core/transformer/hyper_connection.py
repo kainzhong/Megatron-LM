@@ -146,17 +146,18 @@ class HyperConnectionModule(MegatronModule):
         # Both paths expose the same call signatures so the rest of the code
         # is implementation-agnostic.
         if config.use_fused_mhc:
-            from megatron.core.fusions.fused_mhc_kernels import (
-                fused_h_aggregate,
-                fused_h_post_bda,
-                fused_proj_rms,
-                fused_sinkhorn,
-            )
+            raise NotImplementedError("This is not your implementation")
+            # from megatron.core.fusions.fused_mhc_kernels import (
+            #     fused_h_aggregate,
+            #     fused_h_post_bda,
+            #     fused_proj_rms,
+            #     fused_sinkhorn,
+            # )
 
-            self._sinkhorn_op = fused_sinkhorn
-            self._h_aggregate_op = fused_h_aggregate
-            self._h_post_bda_op = fused_h_post_bda
-            self._proj_rms_op = fused_proj_rms
+            # self._sinkhorn_op = fused_sinkhorn
+            # self._h_aggregate_op = fused_h_aggregate
+            # self._h_post_bda_op = fused_h_post_bda
+            # self._proj_rms_op = fused_proj_rms
         else:
             from transformer_engine.pytorch.triton.mhc import (
                 mHCProjectionOp,
