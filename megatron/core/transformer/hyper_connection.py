@@ -14,6 +14,13 @@ from megatron.core.utils import nvtx_decorator
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointManager
 
+from transformer_engine.pytorch.triton.mhc import (
+    mHCProjectionOp,
+    mHCElementwiseOp,
+    mHCSinkhornOp,
+    mHCPreOp,
+    mHCPostResOp,
+)
 
 @torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
@@ -51,44 +58,6 @@ class SinkhornKnopp(torch.autograd.Function):
             M = _sinkhorn_iterations(logits, ctx.num_iterations, ctx.eps)
             M.backward(grad_output)
         return logits.grad, None, None
-
-
-def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
-    """Native Sinkhorn-Knopp (autograd.Function wrapper)."""
-    return SinkhornKnopp.apply(input_logits, num_iterations, eps)
-
-
-@torch.compile
-def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
-    """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
-    return (x * h_pre.unsqueeze(-1)).sum(dim=2)
-
-
-@torch.compile
-def native_h_post_bda(
-    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
-) -> Tensor:
-    """Native H_res @ residual + H_post * (x [+ bias])."""
-    s, b, n, C = original_residual.shape
-    h_res_batched = h_res.view(s * b, n, n)
-    residual_batched = original_residual.view(s * b, n, C)
-    mixed = torch.bmm(h_res_batched, residual_batched).view(s, b, n, C)
-    x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
-    if bias is not None:
-        bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
-        return x_expanded + bias_expanded + mixed
-    return x_expanded + mixed
-
-
-@torch.compile
-def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
-    """Native fused projection + RMS normalization."""
-    proj = torch.matmul(x, weight.t())
-    norm = x.norm(dim=-1, keepdim=True)
-    K = x.shape[-1]
-    v = norm / math.sqrt(K) + eps
-    r = 1.0 / v
-    return proj, r
 
 
 # ============================================================================
@@ -135,9 +104,7 @@ class HyperConnectionModule(MegatronModule):
 
         init_alpha = config.mhc_init_gating_factor
         # Learnable scaling factors (Eq. 5 in paper)
-        self.alpha_pre = nn.Parameter(torch.full((1,), init_alpha))
-        self.alpha_post = nn.Parameter(torch.full((1,), init_alpha))
-        self.alpha_res = nn.Parameter(torch.full((1,), init_alpha))
+        self.alpha = nn.Parameter(torch.full((3,), init_alpha))
 
         # Static bias terms
         self.bias = nn.Parameter(torch.zeros(self.n * self.n + 2 * self.n))
@@ -146,23 +113,42 @@ class HyperConnectionModule(MegatronModule):
         # Choose implementation: fused cuTile kernels vs reference modules.
         # Both paths expose the same call signatures so the rest of the code
         # is implementation-agnostic.
-        if config.use_fused_mhc:
-            from megatron.core.fusions.fused_mhc_kernels import (
-                fused_h_aggregate,
-                fused_h_post_bda,
-                fused_proj_rms,
-                fused_sinkhorn,
+        def fused_sinkhorn(h_res, iterations, eps):
+            return mHCSinkhornOp.apply(h_res, self.n, True, iterations)
+        def fused_scale(proj, alpha, bias, r, n):
+            proj = proj.view(-1, 32)
+            r = r.view(-1)
+            out = mHCElementwiseOp.apply(proj, alpha, bias, r, n)
+            h_pre = out[..., : self.n]
+            h_post = out[..., self.n : 2 * self.n]
+            h_res = out[..., 2 * self.n : self.n * self.n + 2 * self.n]
+            return h_pre, h_post, h_res
+        def fused_h_aggregate(x_streams, h_pre):
+            s, b, C, n = x_streams.shape
+            h_pre = h_pre.reshape(s, b, n)
+            return mHCPreOp.apply(x_streams, h_pre, self.n)
+        def fused_h_post_bda(h_res, orig_reshaped, h_post, x, bias):
+            s, b, C, n = orig_reshaped.shape
+            h_post = h_post.reshape(s, b, n)
+            return mHCPostResOp.apply(
+                x,
+                bias,
+                h_post, 
+                orig_reshaped, 
+                h_res, 
+                20
             )
+        def fused_proj_rms(x, weight):
+            proj, r = mHCProjectionOp.apply(x, weight)
+            proj = proj.squeeze(0)
+            r = r.view(-1, 1)
+            return proj, r
 
-            self._sinkhorn_op = fused_sinkhorn
-            self._h_aggregate_op = fused_h_aggregate
-            self._h_post_bda_op = fused_h_post_bda
-            self._proj_rms_op = fused_proj_rms
-        else:
-            self._sinkhorn_op = native_sinkhorn
-            self._h_aggregate_op = native_h_aggregate
-            self._h_post_bda_op = native_h_post_bda
-            self._proj_rms_op = native_proj_rms
+        self._sinkhorn_op = fused_sinkhorn
+        self._h_scale_op = fused_scale
+        self._h_aggregate_op = fused_h_aggregate
+        self._h_post_bda_op = fused_h_post_bda
+        self._proj_rms_op = fused_proj_rms
 
         self._init_weights()
 
@@ -190,39 +176,8 @@ class HyperConnectionModule(MegatronModule):
         """
         s, b, nC = x.shape
         x_2d = x.reshape(s * b, nC)
-        proj, r = self._proj_rms_op(x_2d, self.mapping_proj.weight, self.norm_eps)
+        proj, r = self._proj_rms_op(x_2d, self.mapping_proj.weight)
         return proj.view(s, b, -1), r.view(s, b, 1)
-
-    @torch.compile
-    def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        """
-        Compute h from projected hidden states and scaling factors.
-
-        Args:
-            proj: [s, b, n^2 + 2n] - projected hidden states
-            r: [s, b, 1] - scaling factors
-
-        Returns:
-            h_pre: [s, b, n] - aggregation weights
-            h_post: [s, b, n] - expansion weights
-            h_res: [s, b, n^2] - residual mixing logits
-        """
-        alpha_ = torch.cat(
-            [
-                self.alpha_pre.expand(self.n),
-                self.alpha_post.expand(self.n),
-                self.alpha_res.expand(self.n * self.n),
-            ],
-            dim=-1,
-        )
-        h = r * proj * alpha_ + self.bias
-        # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
-        h_pre = h[..., : self.n].sigmoid()  # [s, b, n]
-
-        # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
-        h_post = h[..., self.n : 2 * self.n].sigmoid() * 2  # [s, b, n]
-        h_res = h[..., 2 * self.n :]
-        return h_pre, h_post, h_res
 
     @nvtx_decorator(message="HyperConnection::compute_mappings")
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
@@ -243,7 +198,7 @@ class HyperConnectionModule(MegatronModule):
         with torch.cuda.nvtx.range("HyperConnection::projection_and_get_norm"):
             proj, r = self._projection_and_get_norm(x)
         with torch.cuda.nvtx.range("HyperConnection::compute_h"):
-            h_pre, h_post, h_res = self._compute_h(proj, r)
+            h_pre, h_post, h_res = self._h_scale_op(proj, self.alpha, self.bias, r, self.n)
         h_res = self._sinkhorn_op(
             h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations, self.norm_eps
         )  # [s, b, n, n]
@@ -270,17 +225,17 @@ class HyperConnectionModule(MegatronModule):
         s, b, _ = h_post.shape
 
         if x.dim() == 1:
-            # x is bias with shape [C], need to broadcast to [s, b, 1, C]
+            # x is bias with shape [C], need to broadcast to [s, b, C, 1]
             C = x.shape[0]
-            x_expanded = x.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(s, b, 1, C)
+            x_expanded = x.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(s, b, C, 1)
         else:
             # x is [s, b, C]
             C = x.shape[-1]
-            x_expanded = x.unsqueeze(2)  # [s, b, 1, C]
+            x_expanded = x.unsqueeze(3)  # [s, b, C, 1]
 
-        # h_post^T @ x : [s, b, n, 1] * [s, b, 1, C] -> [s, b, n, C]
+        # x @ h_post^T : [s, b, C, 1] * [s, b, 1, n] -> [s, b, C, n]
         # Using broadcast multiply instead of einsum
-        result = h_post.unsqueeze(-1) * x_expanded
+        result = h_post.unsqueeze(-2) * x_expanded
         return result.view(s, b, n * C)
 
     @nvtx_decorator(message="HyperConnection::apply_h_post")
@@ -346,33 +301,8 @@ class HyperConnectionModule(MegatronModule):
         """
         s, b, _ = x.shape
         C = self.hidden_size
-        x_streams = x.view(s, b, self.n, C)
+        x_streams = x.view(s, b, C, self.n)
         return self._h_aggregate_op(x_streams, h_pre)
-
-    @torch.compile
-    def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
-        """
-        Apply H_res to residual using H_res weights.
-
-        Computes: H_res @ residual
-
-        Args:
-            h_res: [s, b, n, n] - residual mixing matrix
-            residual: [s, b, n*C] - n-stream hidden states
-        """
-        s, b, _ = residual.shape
-        n = self.n
-        C = self.hidden_size
-
-        # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
-        h_res_batched = h_res.view(s * b, n, n)
-        # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
-        residual_batched = residual.view(s, b, n, C).view(s * b, n, C)
-
-        # Batch matrix multiply: [s*b, n, n] @ [s*b, n, C] -> [s*b, n, C]
-        mixed = torch.bmm(h_res_batched, residual_batched)
-
-        return mixed.view(s, b, n * C)
 
     def forward(
         self, hidden_states: Tensor, mhc_recompute_manager: Optional['CheckpointManager'] = None
@@ -465,7 +395,7 @@ class HyperConnectionModule(MegatronModule):
         """
         s, b, C = x.shape
         # Replicate input to n streams
-        expanded = x.unsqueeze(2).expand(s, b, n, C).contiguous()
+        expanded = x.unsqueeze(2).expand(s, b, n, C).transpose(2, 3).contiguous()
         return expanded.view(s, b, n * C)
 
     @staticmethod
@@ -485,8 +415,8 @@ class HyperConnectionModule(MegatronModule):
         s, b, nC = x.shape
         C = nC // n
         # Average all streams
-        x_streams = x.view(s, b, n, C)
-        contracted = x_streams.mean(dim=2)
+        x_streams = x.view(s, b, C, n)
+        contracted = x_streams.mean(dim=3)
         return contracted
 
     # ==================== Fused kernel placeholder ====================
@@ -583,25 +513,17 @@ class HyperConnectionModule(MegatronModule):
         """
         x, bias = layer_output_with_bias
 
-        if dropout_prob == 0.0 or not training:
-            s, b, _ = original_residual.shape
-            n = self.n
-            C = self.hidden_size
-            orig_reshaped = original_residual.view(s, b, n, C)
-            output = self._h_post_bda_op(h_res, orig_reshaped, h_post, x, bias)
-            return output.view(s, b, n * C)
+        # TODO: handle BDA fusion with dropout properly
+        if bias is not None:
+            x = x + bias
+        x = torch.nn.functional.dropout(x, p=dropout_prob, training=training, inplace=False)
 
-        from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-
-        with torch.cuda.nvtx.range("HyperConnection::apply_h_res"):
-            mixed = self.apply_h_res(h_res, original_residual)
-        with torch.cuda.nvtx.range("HyperConnection::apply_h_post"):
-            x_expanded = self._apply_h_post(x, h_post)
-            bias_expanded = self._apply_h_post(bias, h_post) if bias is not None else None
-        bda_func = get_bias_dropout_add(training, fused)
-        with torch.cuda.nvtx.range("HyperConnection::bda"):
-            output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
-        return output
+        s, b, _ = original_residual.shape
+        n = self.n
+        C = self.hidden_size
+        orig_reshaped = original_residual.view(s, b, C, n)
+        output = self._h_post_bda_op(h_res, orig_reshaped, h_post, x, None)
+        return output.view(s, b, n * C)
 
     @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_with_checkpoint")
     def _fused_h_res_h_post_bda_with_checkpoint(
@@ -636,55 +558,7 @@ class HyperConnectionModule(MegatronModule):
         Returns:
             output: [s, b, n*C] - final output
         """
-        from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
-
-        x, bias = layer_output_with_bias
-        n = self.n
-        C = self.hidden_size
-
-        # Fast path: no dropout — use fused/reference h_post_bda kernel (same as _native)
-        if dropout_prob == 0.0 or not training:
-
-            def _fused_wrapper(h_res, original_residual, h_post, x, *optional_bias):
-                s, b, _ = original_residual.shape
-                orig_reshaped = original_residual.view(s, b, n, C)
-                b_arg = optional_bias[0] if optional_bias else None
-                return self._h_post_bda_op(h_res, orig_reshaped, h_post, x, b_arg).view(s, b, n * C)
-
-            ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
-            if bias is not None:
-                output = ckpt.checkpoint(_fused_wrapper, h_res, original_residual, h_post, x, bias)
-            else:
-                output = ckpt.checkpoint(_fused_wrapper, h_res, original_residual, h_post, x)
-
-        # Slow path: dropout required — fused kernel does not support dropout,
-        # fall back to sequential apply_h_res + apply_h_post + bda
-        else:
-            from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-
-            bda_func = get_bias_dropout_add(training, fused)
-            has_bias = bias is not None
-
-            def _native_wrapper(h_res, original_residual, h_post, x, *optional_bias):
-                with torch.cuda.nvtx.range("HyperConnection::apply_h_res"):
-                    mixed = self.apply_h_res(h_res, original_residual)
-                with torch.cuda.nvtx.range("HyperConnection::apply_h_post"):
-                    x_expanded = self._apply_h_post(x, h_post)
-                    if has_bias:
-                        bias_expanded = self._apply_h_post(optional_bias[0], h_post)
-                    else:
-                        bias_expanded = None
-                with torch.cuda.nvtx.range("HyperConnection::bda"):
-                    output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
-                return output
-
-            ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
-            if has_bias:
-                output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x, bias)
-            else:
-                output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x)
-
-        return output
+        raise NotImplementedError("Don't use checkpoint for now")
 
 
 # ==================== Checkpoint utilities for mHC ====================
