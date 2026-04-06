@@ -136,7 +136,7 @@ class HyperConnectionModule(MegatronModule):
                 h_post, 
                 orig_reshaped, 
                 h_res, 
-                20
+                4
             )
         def fused_proj_rms(x, weight):
             proj, r = mHCProjectionOp.apply(x, weight)
