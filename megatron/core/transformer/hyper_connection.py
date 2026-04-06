@@ -16,10 +16,10 @@ if TYPE_CHECKING:
 
 from transformer_engine.pytorch.triton.mhc import (
     mHCProjectionOp,
-    mHCElementwiseOp,
+    mHCScaleFusedOp,
     mHCSinkhornOp,
-    mHCPreOp,
-    mHCPostResOp,
+    mHCAggregateOp,
+    mHCExpandCombineOp
 )
 
 @torch.compile
@@ -118,7 +118,7 @@ class HyperConnectionModule(MegatronModule):
         def fused_scale(proj, alpha, bias, r, n):
             proj = proj.view(-1, 32)
             r = r.view(-1)
-            out = mHCElementwiseOp.apply(proj, alpha, bias, r, n)
+            out = mHCScaleFusedOp.apply(proj, alpha, bias, r, n)
             h_pre = out[..., : self.n]
             h_post = out[..., self.n : 2 * self.n]
             h_res = out[..., 2 * self.n : self.n * self.n + 2 * self.n]
@@ -126,11 +126,11 @@ class HyperConnectionModule(MegatronModule):
         def fused_h_aggregate(x_streams, h_pre):
             s, b, C, n = x_streams.shape
             h_pre = h_pre.reshape(s, b, n)
-            return mHCPreOp.apply(x_streams, h_pre, self.n)
+            return mHCAggregateOp.apply(x_streams, h_pre, self.n)
         def fused_h_post_bda(h_res, orig_reshaped, h_post, x, bias):
             s, b, C, n = orig_reshaped.shape
             h_post = h_post.reshape(s, b, n)
-            return mHCPostResOp.apply(
+            return mHCExpandCombineOp.apply(
                 x,
                 bias,
                 h_post, 
