@@ -703,11 +703,11 @@ def forward_backward_no_pipelining(
                     for i, layer in enumerate(model.module.module.decoder.layers):
                         rank = torch.distributed.get_rank()
                         stats = f"Rank {rank}\n"
-                        stats += f"layer {i}: self_attention_hyper_connection.mapping_proj.absmax = {layer.self_attention_hyper_connection.mapping_proj.abs().max().item()}\n"
+                        stats += f"layer {i}: self_attention_hyper_connection.mapping_proj.absmax = {layer.self_attention_hyper_connection.mapping_proj.weight.abs().max().item()}\n"
                         stats += f"layer {i}: self_attention_hyper_connection.alpha = {layer.self_attention_hyper_connection.alpha}\n"
                         stats += f"layer {i}: self_attention_hyper_connection.bias = {layer.self_attention_hyper_connection.bias}\n"
 
-                        stats += f"layer {i}: mlp_hyper_connection.mapping_proj.absmax = {layer.mlp_hyper_connection.mapping_proj.abs().max().item()}\n"
+                        stats += f"layer {i}: mlp_hyper_connection.mapping_proj.absmax = {layer.mlp_hyper_connection.mapping_proj.weight.abs().max().item()}\n"
                         stats += f"layer {i}: mlp_hyper_connection.alpha = {layer.mlp_hyper_connection.alpha}\n"
                         stats += f"layer {i}: mlp_hyper_connection.bias = {layer.mlp_hyper_connection.bias}\n"
 
