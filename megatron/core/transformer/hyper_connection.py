@@ -110,6 +110,17 @@ class HyperConnectionModule(MegatronModule):
         self.bias = nn.Parameter(torch.zeros(self.n * self.n + 2 * self.n))
         self.norm_eps = 1e-6
 
+        def create_hook(name):
+            def grad_hook(grad):
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+                print(f"[RANK {rank}] Layer {layer_number} {name} grad absmax: {grad.abs().max().item()}")
+                return None
+            return grad_hook
+        
+        self.alpha.register_hook(create_hook("alpha"))
+        self.bias.register_hook(create_hook("bias"))
+        self.mapping_proj.weight.register_hook(create_hook("mapping_proj.weight"))
+
         # Choose implementation: fused cuTile kernels vs reference modules.
         # Both paths expose the same call signatures so the rest of the code
         # is implementation-agnostic.
@@ -128,6 +139,8 @@ class HyperConnectionModule(MegatronModule):
             h_pre = h_pre.reshape(s, b, n)
             return mHCAggregateOp.apply(x_streams, h_pre, self.n)
         def fused_h_post_bda(h_res, orig_reshaped, h_post, x, bias):
+            # orig_reshaped: torch.Size([8192, 1, 4096, 4]), h_res: torch.Size([8192, 1, 4, 4]), h_post: torch.Size([8192, 4]), x: torch.Size([8192, 1, 4096]), bias: None
+            # print(f"orig_reshaped: {orig_reshaped.shape}, h_res: {h_res.shape}, h_post: {h_post.shape}, x: {x.shape}, bias: {bias.shape if bias is not None else None}")
             s, b, C, n = orig_reshaped.shape
             h_post = h_post.reshape(s, b, n)
             return mHCExpandCombineOp.apply(
