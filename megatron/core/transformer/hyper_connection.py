@@ -63,7 +63,12 @@ class SinkhornKnopp(torch.autograd.Function):
 # ============================================================================
 # HyperConnectionModule
 # ============================================================================
-
+def create_hook(name):
+    def grad_hook(grad):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        print(f"[RANK {rank}] Layer {layer_number} {name} grad absmax: {grad.abs().max().item()}")
+        return None
+    return grad_hook
 
 # TODO: keep hyper connection in fp32 computation
 class HyperConnectionModule(MegatronModule):
@@ -110,13 +115,7 @@ class HyperConnectionModule(MegatronModule):
         self.bias = nn.Parameter(torch.zeros(self.n * self.n + 2 * self.n))
         self.norm_eps = 1e-6
 
-        def create_hook(name):
-            def grad_hook(grad):
-                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-                print(f"[RANK {rank}] Layer {layer_number} {name} grad absmax: {grad.abs().max().item()}")
-                return None
-            return grad_hook
-        
+    
         self.alpha.register_hook(create_hook("alpha"))
         self.bias.register_hook(create_hook("bias"))
         self.mapping_proj.weight.register_hook(create_hook("mapping_proj.weight"))
@@ -125,7 +124,9 @@ class HyperConnectionModule(MegatronModule):
         # Both paths expose the same call signatures so the rest of the code
         # is implementation-agnostic.
         def fused_sinkhorn(h_res, iterations, eps):
-            return mHCSinkhornOp.apply(h_res, self.n, True, iterations)
+            out = mHCSinkhornOp.apply(h_res, self.n, True, iterations)
+            out.register_hook(create_hook("out_sinkhorn"))
+            return out
         def fused_scale(proj, alpha, bias, r, n):
             proj = proj.view(-1, 32)
             r = r.view(-1)
@@ -133,17 +134,22 @@ class HyperConnectionModule(MegatronModule):
             h_pre = out[..., : self.n]
             h_post = out[..., self.n : 2 * self.n]
             h_res = out[..., 2 * self.n : self.n * self.n + 2 * self.n]
+            h_pre.register_hook(create_hook("h_pre_scale"))
+            h_post.register_hook(create_hook("h_post_scale"))
+            h_res.register_hook(create_hook("h_res_scale"))
             return h_pre, h_post, h_res
         def fused_h_aggregate(x_streams, h_pre):
             s, b, C, n = x_streams.shape
             h_pre = h_pre.reshape(s, b, n)
-            return mHCAggregateOp.apply(x_streams, h_pre, self.n)
+            out = mHCAggregateOp.apply(x_streams, h_pre, self.n)
+            out.register_hook(create_hook("out_aggregate"))
+            return out
         def fused_h_post_bda(h_res, orig_reshaped, h_post, x, bias):
             # orig_reshaped: torch.Size([8192, 1, 4096, 4]), h_res: torch.Size([8192, 1, 4, 4]), h_post: torch.Size([8192, 4]), x: torch.Size([8192, 1, 4096]), bias: None
             # print(f"orig_reshaped: {orig_reshaped.shape}, h_res: {h_res.shape}, h_post: {h_post.shape}, x: {x.shape}, bias: {bias.shape if bias is not None else None}")
             s, b, C, n = orig_reshaped.shape
             h_post = h_post.reshape(s, b, n)
-            return mHCExpandCombineOp.apply(
+            out = mHCExpandCombineOp.apply(
                 x,
                 bias,
                 h_post, 
@@ -151,10 +157,14 @@ class HyperConnectionModule(MegatronModule):
                 h_res, 
                 4
             )
+            out.register_hook(create_hook("out_h_post_bda"))
+            return out
         def fused_proj_rms(x, weight):
             proj, r = mHCProjectionOp.apply(x, weight)
             proj = proj.squeeze(0)
             r = r.view(-1, 1)
+            proj.register_hook(create_hook("proj_proj"))
+            r.register_hook(create_hook("proj_r"))
             return proj, r
 
         self._sinkhorn_op = fused_sinkhorn
