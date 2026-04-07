@@ -63,10 +63,13 @@ class SinkhornKnopp(torch.autograd.Function):
 # ============================================================================
 # HyperConnectionModule
 # ============================================================================
-def create_hook(name, layer_number):
+def create_hook(name, layer_number, print_abs_max=True):
     def grad_hook(grad):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-        print(f"[RANK {rank}] Layer {layer_number} {name} grad absmax: {grad.abs().max().item()}")
+        if print_abs_max:
+            print(f"[RANK {rank}] Layer {layer_number} {name} grad absmax: {grad.abs().max().item()}")
+        else:
+            print(f"[RANK {rank}] Layer {layer_number} {name} grad: {grad}")
         return None
     return grad_hook
 
@@ -116,8 +119,8 @@ class HyperConnectionModule(MegatronModule):
         self.norm_eps = 1e-6
 
     
-        self.alpha.register_hook(create_hook("alpha", self.layer_number))
-        self.bias.register_hook(create_hook("bias", self.layer_number))
+        self.alpha.register_hook(create_hook("alpha", self.layer_number, print_abs_max=False))
+        self.bias.register_hook(create_hook("bias", self.layer_number, print_abs_max=False))
         self.mapping_proj.weight.register_hook(create_hook("mapping_proj.weight", self.layer_number))
 
         # Choose implementation: fused cuTile kernels vs reference modules.
