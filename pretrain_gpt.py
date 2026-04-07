@@ -20,6 +20,7 @@ from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
+torch.autograd.set_detect_anomaly(True)
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
