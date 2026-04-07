@@ -719,6 +719,15 @@ def forward_backward_no_pipelining(
 
         total_num_tokens += num_tokens
 
+        if torch.isnan(model.layer.weight).any():
+            raise ValueError("NaN detected in model parameters after forward pass.")
+        if torch.isinf(model.layer.weight).any():
+            raise ValueError("Inf detected in model parameters after forward pass.")
+        if output_tensor.isnan().any():
+            raise ValueError("NaN detected in output tensor after forward pass.")
+        if output_tensor.isinf().any():
+            raise ValueError("Inf detected in output tensor after forward pass.")
+
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
