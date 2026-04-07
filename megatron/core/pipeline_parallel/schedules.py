@@ -490,10 +490,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     # This results in a tensor that does not require gradients.
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
     if output_tensor[0].requires_grad:
-        if config.deallocate_pipeline_outputs:
-            custom_backward(output_tensor[0], output_tensor_grad[0])
-        else:
-            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+        torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
