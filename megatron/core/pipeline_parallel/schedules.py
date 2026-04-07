@@ -697,6 +697,21 @@ def forward_backward_no_pipelining(
                     current_microbatch=i,
                 )
                 total_num_tokens += num_tokens
+                if torch.distributed.is_initialized():
+                    if torch.distributed.get_rank() == 0:
+                        print(model.module.module)
+                    for i, layer in enumerate(model.module.module.decoder.layers):
+                        rank = torch.distributed.get_rank()
+                        stats = f"Rank {rank}\n"
+                        stats += f"layer {i}: self_attention_hyper_connection.mapping_proj.absmax = {layer.self_attention_hyper_connection.mapping_proj.abs().max().item()}\n"
+                        stats += f"layer {i}: self_attention_hyper_connection.alpha = {layer.self_attention_hyper_connection.alpha}\n"
+                        stats += f"layer {i}: self_attention_hyper_connection.bias = {layer.self_attention_hyper_connection.bias}\n"
+
+                        stats += f"layer {i}: mlp_hyper_connection.mapping_proj.absmax = {layer.mlp_hyper_connection.mapping_proj.abs().max().item()}\n"
+                        stats += f"layer {i}: mlp_hyper_connection.alpha = {layer.mlp_hyper_connection.alpha}\n"
+                        stats += f"layer {i}: mlp_hyper_connection.bias = {layer.mlp_hyper_connection.bias}\n"
+
+                        print(f"\n{stats}\n", flush=True)
                 if not forward_only:
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
         # Run computation for last microbatch out of context handler (want to
@@ -718,23 +733,6 @@ def forward_backward_no_pipelining(
         )
 
         total_num_tokens += num_tokens
-
-        if torch.distributed.is_initialized():
-            if torch.distributed.get_rank() == 0:
-                print(model.module.module)
-            for i, layer in enumerate(model.module.module.decoder.layers):
-                rank = torch.distributed.get_rank()
-                stats = f"Rank {rank}\n"
-                stats += f"layer {i}: self_attention_hyper_connection.mapping_proj.absmax = {layer.self_attention_hyper_connection.mapping_proj.abs().max().item()}\n"
-                stats += f"layer {i}: self_attention_hyper_connection.alpha = {layer.self_attention_hyper_connection.alpha}\n"
-                stats += f"layer {i}: self_attention_hyper_connection.bias = {layer.self_attention_hyper_connection.bias}\n"
-
-                stats += f"layer {i}: mlp_hyper_connection.mapping_proj.absmax = {layer.mlp_hyper_connection.mapping_proj.abs().max().item()}\n"
-                stats += f"layer {i}: mlp_hyper_connection.alpha = {layer.mlp_hyper_connection.alpha}\n"
-                stats += f"layer {i}: mlp_hyper_connection.bias = {layer.mlp_hyper_connection.bias}\n"
-
-                print(f"\n{stats}\n", flush=True)
-
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
