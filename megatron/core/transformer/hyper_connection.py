@@ -15,11 +15,11 @@ if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointManager
 
 from transformer_engine.pytorch.triton.mhc import (
-    mHCProjectionOp,
-    mHCScaleFusedOp,
-    mHCSinkhornOp,
-    mHCAggregateOp,
-    mHCExpandCombineOp
+    mhc_fused_sinkhorn,
+    mhc_fused_scale,
+    mhc_fused_aggregate,
+    mhc_fused_expand_combine,
+    mhc_fused_projection,
 )
 
 @torch.compile
@@ -114,23 +114,20 @@ class HyperConnectionModule(MegatronModule):
         # Both paths expose the same call signatures so the rest of the code
         # is implementation-agnostic.
         def fused_sinkhorn(h_res, iterations, eps):
-            return mHCSinkhornOp.apply(h_res, self.n, True, iterations)
+            return mhc_fused_sinkhorn(h_res, self.n, True, iterations)
         def fused_scale(proj, alpha, bias, r, n):
-            proj = proj.view(-1, 32)
+            proj = proj.view(-1, 32 if n == 4 else 8)
             r = r.view(-1)
-            out = mHCScaleFusedOp.apply(proj, alpha, bias, r, n)
-            h_pre = out[..., : self.n]
-            h_post = out[..., self.n : 2 * self.n]
-            h_res = out[..., 2 * self.n : self.n * self.n + 2 * self.n]
+            h_pre, h_post, h_res = mhc_fused_scale(proj, alpha, bias, r, n)
             return h_pre, h_post, h_res
         def fused_h_aggregate(x_streams, h_pre):
             s, b, C, n = x_streams.shape
             h_pre = h_pre.reshape(s, b, n)
-            return mHCAggregateOp.apply(x_streams, h_pre, self.n)
+            return mhc_fused_aggregate(x_streams, h_pre, self.n)
         def fused_h_post_bda(h_res, orig_reshaped, h_post, x, bias):
             s, b, C, n = orig_reshaped.shape
             h_post = h_post.reshape(s, b, n)
-            return mHCExpandCombineOp.apply(
+            return mhc_fused_expand_combine(
                 x,
                 bias,
                 h_post, 
@@ -139,7 +136,7 @@ class HyperConnectionModule(MegatronModule):
                 4
             )
         def fused_proj_rms(x, weight):
-            proj, r = mHCProjectionOp.apply(x, weight)
+            proj, r = mhc_fused_projection(x, weight)
             proj = proj.squeeze(0)
             r = r.view(-1, 1)
             return proj, r
